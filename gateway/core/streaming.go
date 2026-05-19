@@ -4,25 +4,32 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
 const (
-	streamTimeout   = 90 * time.Minute
+	streamTimeout   = 3 * time.Hour
 	wsCloseUnknown  = 4000
 	wsCloseDown     = 4001
 	wsCloseFailed   = 4002
 	wsCloseTooLarge = 4003
 	wsCloseNoAudio  = 4004
 )
+
+// errTypeSTTError mirrors ErrTypeSTTError in gateway/metrics.go. Kept as a
+// local constant because the ErrType* closed vocabulary lives in the private
+// main package; core/ cannot import it.
+const errTypeSTTError = "stt_error"
 
 type streamAction struct {
 	Action   string `json:"action"`
@@ -32,6 +39,69 @@ type streamAction struct {
 type streamResult struct {
 	Text string `json:"text"`
 	Mode string `json:"mode,omitempty"`
+}
+
+// Reason — closed vocabulary for ws_read close classification. Kept in sync
+// with the `reason` tag constants in gateway/metrics.go (Reason*).
+const (
+	wsReasonEOF           = "eof"
+	wsReasonGoingAway     = "going_away"
+	wsReasonIdleTimeout   = "idle_timeout"
+	wsReasonStreamTimeout = "stream_timeout"
+	wsReasonProtocol      = "protocol"
+	wsReasonUnknown       = "unknown"
+)
+
+// ClassifyWSError maps a conn.Read error to a closed-vocabulary reason tag.
+// Idle-timeout classification is done by the caller via the external
+// time.AfterFunc watchdog (see the main read loop); when this function sees
+// a context error it always means the outer 90-min stream cap fired or the
+// HTTP request ctx was canceled by the framework.
+func ClassifyWSError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ce websocket.CloseError
+	if errors.As(err, &ce) {
+		switch ce.Code {
+		case websocket.StatusGoingAway:
+			return wsReasonGoingAway
+		case websocket.StatusProtocolError, websocket.StatusInvalidFramePayloadData,
+			websocket.StatusUnsupportedData, websocket.StatusMandatoryExtension:
+			return wsReasonProtocol
+		}
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return wsReasonStreamTimeout
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return wsReasonEOF
+	}
+	s := err.Error()
+	switch {
+	case strings.Contains(s, "EOF"):
+		return wsReasonEOF
+	case strings.Contains(s, "StatusGoingAway"), strings.Contains(s, "going away"):
+		return wsReasonGoingAway
+	case strings.Contains(s, "protocol"):
+		return wsReasonProtocol
+	}
+	return wsReasonUnknown
+}
+
+// CloseWSWithTimeout calls conn.Close with a bounded write budget so a
+// NAT-orphaned half-open socket cannot re-introduce the multi-minute hang
+// we are trying to end. defer conn.CloseNow() remains as a final safety net.
+func CloseWSWithTimeout(conn *websocket.Conn, code websocket.StatusCode, reason string, budget time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		_ = conn.Close(code, reason)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(budget):
+	}
 }
 
 // StreamingHandler returns the handler for WS /v1/audio/stream.
@@ -52,25 +122,57 @@ func (g *Gateway) StreamingHandler() http.HandlerFunc {
 // postProcess receives (ctx, transcript, contextJSON, intent) and returns (resultText, mode, error).
 func (g *Gateway) StreamingHandlerWithPostProcess(postProcess func(context.Context, string, string, string) (string, string, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Resolve backend before upgrade — route to best model for the language
+		// Resolve backend before upgrade — route to best model for the language.
+		// Auto-detect: when ?language=auto is present, route to a detect-capable
+		// model and instruct proxyToBackend to omit the language field upstream
+		// so native LID can run. Old clients send a concrete code and fall
+		// through to existing routing.
 		language := r.URL.Query().Get("language")
-		model := g.ModelForLanguage(language)
+		var (
+			model                 string
+			stripUpstreamLanguage bool
+			detectActive          = IsAutoDetect(language)
+		)
+		if detectActive {
+			if detectModel, strip := g.ModelForAutoDetect(); detectModel != "" {
+				model = detectModel
+				stripUpstreamLanguage = strip
+			}
+		}
+		if model == "" {
+			model = g.ModelForLanguage(language)
+		}
 		target, backend := g.resolveBackend(model)
 		if target == nil || (!backend.SkipHealthCheck && !g.health.get(model)) {
 			http.Error(w, `{"error":"backend unavailable"}`, http.StatusServiceUnavailable)
 			return
 		}
 		if g.fallbackModel != "" {
-			log.Printf("Route: language=%s → model=%s", language, model)
+			log.Printf("Route: language=%s detect=%v → model=%s",
+				language, detectActive, model)
 		}
 		w.Header().Set("X-Diction-Route-Lang", language)
 		w.Header().Set("X-Diction-Route-Model", model)
+		if detectActive {
+			w.Header().Set("X-Diction-Route-Detect", "true")
+		}
 
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true, // allow any origin for now
 		})
 		if err != nil {
 			log.Printf("ws accept: %v", err)
+			if OnError != nil {
+				OnError(r.Context(), ErrorEvent{
+					Source:   "streaming",
+					Kind:     "ws_accept",
+					Endpoint: "/v1/audio/stream",
+					Hint:     "websocket accept failed",
+				})
+			}
+			if OnRequestFailed != nil {
+				OnRequestFailed(r.Context(), errTypeSTTError)
+			}
 			return
 		}
 		defer conn.CloseNow()
@@ -84,16 +186,83 @@ func (g *Gateway) StreamingHandlerWithPostProcess(postProcess func(context.Conte
 		maxPCM := g.maxBodySize
 		contextRead := false
 
+		idleTimeout := g.streamIdleTimeout
+		if idleTimeout <= 0 {
+			idleTimeout = defaultStreamIdleTimeout
+		}
+
 		for {
+			// Idle watchdog: if no frame arrives within idleTimeout, call
+			// conn.Close from a goroutine so a close frame is written before
+			// the underlying connection is torn down. A per-frame
+			// context.WithTimeout is NOT usable here: coder/websocket's
+			// context.AfterFunc hook calls c.close() on ctx expiry, which
+			// kills TCP before we can send StatusPolicyViolation.
+			idleFired := make(chan struct{})
+			idleTimer := time.AfterFunc(idleTimeout, func() {
+				CloseWSWithTimeout(conn, websocket.StatusPolicyViolation, "idle_timeout", 2*time.Second)
+				close(idleFired)
+			})
 			msgType, data, err := conn.Read(ctx)
+			stopped := idleTimer.Stop()
+			// Stop returns false if the timer already fired — wait for the
+			// callback to finish so we know the close frame has been written
+			// (or its 2s budget is exhausted).
+			if !stopped {
+				<-idleFired
+			}
 			if err != nil {
 				log.Printf("ws read: %v", err)
+				var reason string
+				if !stopped {
+					reason = wsReasonIdleTimeout
+				} else {
+					reason = ClassifyWSError(err)
+				}
+				if OnError != nil {
+					OnError(ctx, ErrorEvent{
+						Source:   "streaming",
+						Kind:     "ws_read",
+						Reason:   reason,
+						Endpoint: "/v1/audio/stream",
+						Hint:     "websocket read failed: " + reason,
+					})
+				}
+				if OnRequestFailed != nil {
+					OnRequestFailed(ctx, errTypeSTTError)
+				}
+				if stopped {
+					// Non-idle error: issue our own bounded close.
+					CloseWSWithTimeout(conn, websocket.StatusInternalError, reason, 2*time.Second)
+				}
+				return
+			}
+			if !stopped {
+				// Race: a valid frame arrived as the idle timer fired. From
+				// the user's perspective the stream terminated due to idle
+				// timeout — emit the matching ws_read/idle_timeout error so
+				// dashboards don't see an orphan success=false request.
+				if OnError != nil {
+					OnError(ctx, ErrorEvent{
+						Source:   "streaming",
+						Kind:     "ws_read",
+						Reason:   wsReasonIdleTimeout,
+						Endpoint: "/v1/audio/stream",
+						Hint:     "websocket read failed: " + wsReasonIdleTimeout,
+					})
+				}
+				if OnRequestFailed != nil {
+					OnRequestFailed(ctx, errTypeSTTError)
+				}
 				return
 			}
 
 			if msgType == websocket.MessageBinary {
 				if int64(pcmBuf.Len())+int64(len(data)) > maxPCM {
-					conn.Close(wsCloseTooLarge, "audio too large")
+					if OnRequestFailed != nil {
+						OnRequestFailed(ctx, errTypeSTTError)
+					}
+					CloseWSWithTimeout(conn, wsCloseTooLarge, "audio too large", 2*time.Second)
 					return
 				}
 				pcmBuf.Write(data)
@@ -113,7 +282,12 @@ func (g *Gateway) StreamingHandlerWithPostProcess(postProcess func(context.Conte
 					continue
 				}
 				if action.Action == "done" {
-					if action.Language != "" {
+					// Mid-stream language override is a re-routing hint for single-language
+					// clients. When auto-detect is active on this connection we've already
+					// committed to a detect-capable model and stripped `language` upstream,
+					// so honouring the hint here would either re-introduce a wrong code or
+					// re-route to a non-detect model. Ignore it.
+					if action.Language != "" && !stripUpstreamLanguage {
 						language = action.Language
 					}
 					break
@@ -128,15 +302,35 @@ func (g *Gateway) StreamingHandlerWithPostProcess(postProcess func(context.Conte
 		}
 
 		if pcmBuf.Len() == 0 {
-			conn.Close(wsCloseNoAudio, "no audio received")
+			if OnRequestFailed != nil {
+				OnRequestFailed(ctx, errTypeSTTError)
+			}
+			CloseWSWithTimeout(conn, wsCloseNoAudio, "no audio received", 2*time.Second)
 			return
 		}
 
-		// Wrap PCM in WAV header and POST to backend
-		text, err := g.proxyToBackend(ctx, target, pcmBuf.Bytes(), backend, language)
+		// Wrap PCM in WAV header and POST to backend. When auto-detect routing is
+		// active, omit the language upstream so the model runs native auto-LID.
+		upstreamLanguage := language
+		if stripUpstreamLanguage {
+			upstreamLanguage = ""
+		}
+		text, err := g.proxyToBackend(ctx, target, pcmBuf.Bytes(), backend, upstreamLanguage)
 		if err != nil {
 			log.Printf("ws proxy: %v", err)
-			conn.Close(wsCloseFailed, "transcription failed")
+			if OnError != nil {
+				OnError(ctx, ErrorEvent{
+					Source:   "stt",
+					Kind:     "stt_backend_error",
+					Endpoint: "/v1/audio/stream",
+					Provider: backend.Name,
+					Hint:     "backend transcription failed",
+				})
+			}
+			if OnRequestFailed != nil {
+				OnRequestFailed(ctx, errTypeSTTError)
+			}
+			CloseWSWithTimeout(conn, wsCloseFailed, "transcription failed", 2*time.Second)
 			return
 		}
 
@@ -149,16 +343,31 @@ func (g *Gateway) StreamingHandlerWithPostProcess(postProcess func(context.Conte
 				mode = resultMode
 			} else {
 				log.Printf("ws post-process: %v", err)
+				if OnError != nil {
+					OnError(ctx, ErrorEvent{
+						Source:     "stt",
+						Kind:       "stt_post_process",
+						Endpoint:   "/v1/audio/stream",
+						InputChars: len(text),
+						Hint:       "streaming post-process failed; returning raw",
+					})
+				}
+				if OnRequestFailed != nil {
+					OnRequestFailed(ctx, errTypeSTTError)
+				}
 			}
 		}
 
 		result, _ := json.Marshal(streamResult{Text: text, Mode: mode})
 		if err := conn.Write(ctx, websocket.MessageText, result); err != nil {
 			log.Printf("ws write result: %v", err)
+			if OnRequestFailed != nil {
+				OnRequestFailed(ctx, errTypeSTTError)
+			}
 			return
 		}
 
-		conn.Close(websocket.StatusNormalClosure, "")
+		CloseWSWithTimeout(conn, websocket.StatusNormalClosure, "", 2*time.Second)
 	}
 }
 
@@ -183,14 +392,9 @@ func (g *Gateway) proxyToBackend(ctx context.Context, target *url.URL, pcm []byt
 		return "", fmt.Errorf("copy wav: %w", err)
 	}
 
-	modelToForward := backend.ForwardModel
-	if modelToForward == "" {
-		// ForwardModel should always be set for backends whose Name is a short alias
-		// not registered by the server (e.g. "large-v3-turbo" vs the full HuggingFace
-		// model ID). Using the Name as fallback will cause a 500 from faster-whisper-server.
-		modelToForward = backend.Name
+	if backend.ForwardModel != "" {
+		writer.WriteField("model", backend.ForwardModel)
 	}
-	writer.WriteField("model", modelToForward)
 	if language != "" {
 		writer.WriteField("language", language)
 	}
@@ -211,7 +415,7 @@ func (g *Gateway) proxyToBackend(ctx context.Context, target *url.URL, pcm []byt
 		req.Header.Set("Authorization", backend.AuthHeader)
 	}
 
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{Timeout: 90 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("backend request: %w", err)
