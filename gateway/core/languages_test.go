@@ -221,3 +221,53 @@ func TestModelForLanguage_NoEnglishModel_EnUsesDefault(t *testing.T) {
 		t.Errorf("got %q, want canary-v2", got)
 	}
 }
+
+// --- IsAutoDetect ---
+
+func TestIsAutoDetect(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"auto", true},
+		{"AUTO", true},
+		{" auto ", true},
+		{"Auto", true},
+		{"", false},
+		{"en", false},
+		{"en,fr", false}, // CSV is no longer special-cased
+		{"automatic", false},
+	}
+	for _, tt := range tests {
+		if got := IsAutoDetect(tt.in); got != tt.want {
+			t.Errorf("IsAutoDetect(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// --- ModelForAutoDetect ---
+
+func TestModelForAutoDetect_FallbackConfigured(t *testing.T) {
+	g := &Gateway{
+		defaultModel:  "canary-v2",
+		fallbackModel: "large-v3-turbo",
+		health:        newHealthState(),
+	}
+	g.health.set("large-v3-turbo", true)
+	model, strip := g.ModelForAutoDetect()
+	if model != "large-v3-turbo" || !strip {
+		t.Errorf("got (%q,%v), want (large-v3-turbo,true)", model, strip)
+	}
+}
+
+func TestModelForAutoDetect_NoFallbackConfigured(t *testing.T) {
+	g := &Gateway{
+		defaultModel:  "small",
+		fallbackModel: "",
+		health:        newHealthState(),
+	}
+	model, strip := g.ModelForAutoDetect()
+	if model != "" || strip {
+		t.Errorf("no fallback: got (%q,%v), want (\"\",false) (defer to single-lang routing)", model, strip)
+	}
+}

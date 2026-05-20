@@ -2,6 +2,18 @@ package core
 
 import "strings"
 
+// AutoDetectSentinel is the `language` field value clients send when the user has
+// opted into auto-detect. The gateway routes these requests to a detect-capable
+// model and strips the field before forwarding upstream so the model performs
+// native language ID instead of being locked to a specific code.
+const AutoDetectSentinel = "auto"
+
+// IsAutoDetect reports whether the language string is the auto-detect sentinel.
+// Case-insensitive + trimmed so misconfigured clients still hit the auto path.
+func IsAutoDetect(lang string) bool {
+	return strings.EqualFold(strings.TrimSpace(lang), AutoDetectSentinel)
+}
+
 // euLanguages is the set of 25 European language codes supported by both
 // Parakeet v3 and Canary-1B-v2. These get the best-accuracy EU model;
 // all other languages fall back to Whisper large-v3-turbo (99 languages).
@@ -64,4 +76,21 @@ func (g *Gateway) ModelForLanguage(lang string) string {
 		return g.defaultModel
 	}
 	return g.fallbackModel
+}
+
+// ModelForAutoDetect picks the upstream model when the client sent
+// `language=auto`. Always returns the fallback (Whisper large-v3-turbo) today —
+// it auto-LIDs natively across 99 languages. Future routing (e.g. Parakeet-v3
+// for an EU-only fast path) plugs in here without touching the call sites.
+//
+// Returns (model, stripUpstreamLanguage):
+//   - stripUpstreamLanguage is always true: the caller must omit `language`
+//     when forwarding so the model performs native LID.
+//   - If no fallback is configured (single-model dev setup), returns ("", false)
+//     and the caller falls back to `ModelForLanguage`.
+func (g *Gateway) ModelForAutoDetect() (string, bool) {
+	if g.fallbackModel == "" {
+		return "", false
+	}
+	return g.fallbackModel, true
 }

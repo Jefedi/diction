@@ -29,6 +29,18 @@ func (h *healthState) get(name string) bool {
 	return h.available[name]
 }
 
+// SetServiceHealth sets the health status of a named service. This is the
+// public API for external code (e.g. private gateway wiring) to register
+// additional services in the health state alongside the built-in backends.
+func (g *Gateway) SetServiceHealth(name string, ok bool) {
+	g.health.set(name, ok)
+}
+
+// IsServiceHealthy returns whether a named service is currently healthy.
+func (g *Gateway) IsServiceHealthy(name string) bool {
+	return g.health.get(name)
+}
+
 func (g *Gateway) startHealthChecker() {
 	check := func() {
 		client := &http.Client{Timeout: 5 * time.Second}
