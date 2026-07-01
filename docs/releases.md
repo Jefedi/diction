@@ -7,6 +7,17 @@ description: What's new in each Diction release. Full changelog for every App St
 
 # Release Notes
 
+## Diction 9.0
+
+- Cloud transcription is about twice as fast end to end, so text lands in your app almost as soon as you stop speaking.
+- An emoji picker is built into the keyboard, with search and skin tone variants, so you can grab the right one without leaving Diction.
+- The QWERTY spacebar row now has a period key, so ending a sentence is one tap instead of a stretch.
+- Pause and resume mid-dictation. Take a breath, gather a thought, then pick up where you left off without losing context.
+- Hold space and slide to move the cursor like a trackpad, matching what your thumb already knows from the system keyboard.
+- The mic releases the instant your phone rings, so you never miss a call because Diction is holding the audio session.
+- Diction mode is now equally reliable online or offline. No more failed attempts when your network drops for a moment.
+- Choose what music does while you dictate: keep playing, duck, or pause. Whichever fits how you use audio.
+
 ## Diction 8.0
 
 - Brand-new autocorrect engine, the first real one in Diction. It quietly fixes common mistakes as you type, with no setup required.
