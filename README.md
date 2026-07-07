@@ -7,13 +7,13 @@
   <br><br>
   <strong>The iOS keyboard for voice and AI.</strong>
   <br><br>
-  Dictate, compose, and edit — by voice, in any app.<br>On-device, cloud, or self-hosted. Open-source gateway.
+  Dictate, compose, and edit - by voice, in any app.<br>On-device, cloud, or self-hosted. Open-source gateway.
 </p>
 
 <p align="center">
-  <img src="assets/slide-hero.png" alt="Diction — Voice and AI Keyboard" width="220">
+  <img src="assets/slide-hero.png" alt="Diction - Voice and AI Keyboard" width="220">
   &nbsp;&nbsp;
-  <img src="assets/slide-privacy.png" alt="Privacy — Zero Tracking" width="220">
+  <img src="assets/slide-privacy.png" alt="Privacy - Zero Tracking" width="220">
   &nbsp;&nbsp;
   <img src="assets/slide-keyboard.png" alt="Your Keyboard" width="220">
 </p>
