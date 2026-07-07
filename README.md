@@ -11,11 +11,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/slide-hero.png" alt="Diction - Voice and AI Keyboard" width="220">
+  <img src="assets/1.png" width="220">
   &nbsp;&nbsp;
-  <img src="assets/slide-privacy.png" alt="Privacy - Zero Tracking" width="220">
+  <img src="assets/2.png" width="220">
   &nbsp;&nbsp;
-  <img src="assets/slide-keyboard.png" alt="Your Keyboard" width="220">
+  <img src="assets/3.png" width="220">
 </p>
 
 <p align="center">
