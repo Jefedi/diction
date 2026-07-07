@@ -5,9 +5,17 @@
     <img src="assets/logo-dark.png" alt="Diction" height="50">
   </picture>
   <br><br>
-  <strong>Speak to Type and Edit</strong>
+  <strong>The iOS keyboard for voice and AI.</strong>
   <br><br>
-  Voice keyboard for iOS. Works in every app.<br>On-device, cloud, or self-hosted - no limits.
+  Dictate, compose, and edit — by voice, in any app.<br>On-device, cloud, or self-hosted. Open-source gateway.
+</p>
+
+<p align="center">
+  <img src="assets/slide-hero.png" alt="Diction — Voice and AI Keyboard" width="220">
+  &nbsp;&nbsp;
+  <img src="assets/slide-privacy.png" alt="Privacy — Zero Tracking" width="220">
+  &nbsp;&nbsp;
+  <img src="assets/slide-keyboard.png" alt="Your Keyboard" width="220">
 </p>
 
 <p align="center">
@@ -27,23 +35,16 @@
 
 ---
 
-<p align="center">
-  <img src="assets/slide-01.png" width="200" alt="You talk. We type.">&nbsp;
-  <img src="assets/slide-02.png" width="200" alt="No limits. No word caps. No catch.">&nbsp;
-  <img src="assets/slide-03.png" width="200" alt="What you say stays with you.">&nbsp;
-  <img src="assets/slide-04.png" width="200" alt="Self-host. Your server, your rules.">
-</p>
-
 ## Why Diction?
 
-- **Works in every app.** Tap the mic, speak, watch text land in whatever app you're in - Telegram, Mail, Notes, the search bar, anywhere a keyboard appears.
-- **Self-hosted in minutes.** `docker compose up -d` and paste your server's IP. Your hardware, your models, your data.
-- **Works with any Whisper-compatible server.** The gateway speaks the OpenAI transcription API (`POST /v1/audio/transcriptions`). Point it at any endpoint that implements it.
-- **On-device.** Whisper runs locally on your iPhone via WhisperKit. No network, no server, nothing leaves the device.
-- **AI transcript cleanup.** Wire any OpenAI-compatible LLM - OpenAI, Groq, Ollama, Anthropic - into the gateway to strip filler words and fix punctuation before text reaches the app. BYO prompt.
-- **End-to-end encrypted.** AES-256-GCM with X25519 key exchange between the app and the gateway. Same primitives used by Signal and WireGuard.
-- **Zero tracking in the app.** No analytics, no telemetry, no data collection. Audit the source yourself.
-- **Free and unlimited.** On-device and self-hosted modes have no caps, no word limits, no expiry.
+- **Voice and AI, built into the keyboard.** Tap to dictate. Tap again, AI writes the message for you. Tap again, AI edits the whole field. Custom modes let you add your own AI prompts, URL schemes, and Shortcuts.
+- **Full keyboard, not just a mic button.** QWERTY when you need it, voice when you want it. The keyboard you never need to switch away from.
+- **Self-hosted in one command.** `docker compose up` and paste the URL. Your server, your models, your data.
+- **Works with any Whisper server.** Diction speaks the OpenAI transcription API directly. Point it at any endpoint that implements it, with or without our gateway.
+- **On-device.** Whisper and Parakeet run locally on your iPhone. No network, no server, nothing leaves the device.
+- **Encrypted in transit.** AES-256-GCM with X25519 key exchange between the app and the gateway. Same primitives used by Signal and WireGuard.
+- **Zero tracking.** No analytics, no telemetry, no data collection. Audit the source yourself.
+- **Free and unlimited.** On-device and self-hosted have no caps, no restrictions, no expiry.
 
 ## Self-Hosting
 
