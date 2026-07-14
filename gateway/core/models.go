@@ -38,6 +38,7 @@ var providerNames = map[string]string{
 	"whisper":  "Faster Whisper",
 	"parakeet": "NVIDIA Parakeet",
 	"canary":   "NVIDIA Canary",
+	"cohere":   "Cohere",
 }
 
 // ModelsHandler returns the handler for GET /v1/models.

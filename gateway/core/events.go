@@ -44,6 +44,7 @@ type ErrorEvent struct {
 	AliveCount            int64  // kbkill_heartbeat_stale: alive VC count at last beat
 	QwertyVisible         int64  // kbkill_heartbeat_stale: 1=visible, 2=hidden, 0=unknown
 	AppearFpMB            int64  // kbkill_heartbeat_stale: phys_footprint at viewWillAppear-end
+	CrashStack            string // kbkill_metrickit_crash: leaf-first binary+offset frames, ≤200 chars, empty when stack unavailable
 }
 
 // OnError is called with a structured error event. Nil by default —

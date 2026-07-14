@@ -11,8 +11,10 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/textproto"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -462,147 +464,253 @@ func (g *Gateway) TranscriptionHandlerWithPostProcess(postProcess func(context.C
 		// Capture E2E client key before proxy (X-Diction-E2E header carries client ephemeral X25519 pubkey)
 		e2eClientKey := r.Header.Get("X-Diction-E2E")
 
-		// Proxy via httputil.ReverseProxy
+		// buildProxy creates a ReverseProxy configured for the given backend/target.
+		// whisperStart is captured once and shared across attempts so the total
+		// latency header reflects the full wall-clock time including retries.
 		enhanceEnabled := r.URL.Query().Get("enhance") == "true"
 		whisperStart := time.Now()
-		proxy := &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				req.URL.Scheme = target.Scheme
-				req.URL.Host = target.Host
-				path := "/v1/audio/transcriptions"
-				if backend.TargetPath != "" {
-					path = backend.TargetPath
-				}
-				req.URL.Path = path
-				req.Host = target.Host
-				req.Header.Set("Content-Type", proxyContentType)
-				req.Body = io.NopCloser(bytes.NewReader(proxyBody))
-				req.ContentLength = int64(len(proxyBody))
-				if backend.AuthHeader != "" {
-					req.Header.Set("Authorization", backend.AuthHeader)
-				}
-			},
-			ModifyResponse: func(resp *http.Response) error {
-				whisperMs := time.Since(whisperStart).Milliseconds()
-				resp.Header.Set("X-Diction-Whisper-Ms", fmt.Sprintf("%d", whisperMs))
 
-				if resp.StatusCode != http.StatusOK {
-					return nil
-				}
-
-				// Always read the response body to extract the transcript text for metrics,
-				// even when no rewrite is needed. The body is restored below.
-				respBody, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err != nil {
-					resp.Body = io.NopCloser(bytes.NewReader(respBody))
-					return nil
-				}
-
-				// Parse {"text": "..."} — permissive: also succeeds on verbose_json
-				// because Go's json.Unmarshal ignores extra fields.
-				var transcription struct {
-					Text     string `json:"text"`
-					Language string `json:"language"`
-				}
-				if err := json.Unmarshal(respBody, &transcription); err != nil || transcription.Text == "" {
-					resp.Body = io.NopCloser(bytes.NewReader(respBody))
-					return nil
-				}
-
-				// Whisper verbose_json path: re-wrap as {"text":"..."} before any
-				// further processing so the client never sees verbose_json. Also
-				// record the detected language into the device profile.
-				if detectActive && isWhisperTier && transcription.Language != "" {
-					if wrapped, marshalErr := json.Marshal(map[string]string{"text": transcription.Text}); marshalErr == nil {
-						respBody = wrapped
+		buildProxy := func(proxyTarget *url.URL, proxyBackend *Backend) *httputil.ReverseProxy {
+			return &httputil.ReverseProxy{
+				Director: func(req *http.Request) {
+					req.URL.Scheme = proxyTarget.Scheme
+					req.URL.Host = proxyTarget.Host
+					path := "/v1/audio/transcriptions"
+					if proxyBackend.TargetPath != "" {
+						path = proxyBackend.TargetPath
 					}
-					if adCtx.DeviceHash != "" && g.profileStore != nil {
-						go g.profileStore.RecordLanguage(adCtx.DeviceHash, transcription.Language)
+					req.URL.Path = path
+					req.Host = proxyTarget.Host
+					req.Header.Set("Content-Type", proxyContentType)
+					req.Body = io.NopCloser(bytes.NewReader(proxyBody))
+					req.ContentLength = int64(len(proxyBody))
+					if proxyBackend.AuthHeader != "" {
+						req.Header.Set("Authorization", proxyBackend.AuthHeader)
 					}
-					if g.OnAutoDetect != nil {
-						g.OnAutoDetect(resp.Request.Context(), "", transcription.Language)
+				},
+				ModifyResponse: func(resp *http.Response) error {
+					whisperMs := time.Since(whisperStart).Milliseconds()
+					resp.Header.Set("X-Diction-Whisper-Ms", fmt.Sprintf("%d", whisperMs))
+
+					if resp.StatusCode != http.StatusOK {
+						return nil
 					}
-				}
 
-				transcript := transcription.Text
-				if g.OnTranscription != nil {
-					g.OnTranscription(resp.Request.Context(), backend.Name, whisperMs, len(transcript), audioDurationMs, enhanceEnabled, e2eClientKey != "")
-				}
-
-				// Backends with a custom TargetPath (e.g. Canary) may return extra fields
-				// (e.g. "timestamps":null) that aren't part of the gateway contract — always
-				// normalize their response body to {"text":"..."}.
-				needsNormalize := backend.TargetPath != ""
-				needsRewrite := (postProcess != nil && enhanceEnabled) || e2eClientKey != "" || needsNormalize || responseFormat != "json"
-				if !needsRewrite {
-					resp.Body = io.NopCloser(bytes.NewReader(respBody))
-					return nil
-				}
-
-				// LLM post-processing (if requested)
-				var mode string
-				if postProcess != nil && enhanceEnabled {
-					intent := r.URL.Query().Get("intent")
-					llmStart := time.Now()
-					resultText, resultMode, err := postProcess(resp.Request.Context(), transcript, contextJSON, intent)
-					llmMs := time.Since(llmStart).Milliseconds()
-					resp.Header.Set("X-Diction-LLM-Ms", fmt.Sprintf("%d", llmMs))
+					// Always read the response body to extract the transcript text for metrics,
+					// even when no rewrite is needed. The body is restored below.
+					respBody, err := io.ReadAll(resp.Body)
+					resp.Body.Close()
 					if err != nil {
-						log.Printf("post-process error (returning raw): %v", err)
-						if OnError != nil {
-							OnError(resp.Request.Context(), ErrorEvent{
-								Source:     "stt",
-								Kind:       "stt_post_process",
-								Endpoint:   "/v1/audio/transcriptions",
-								Provider:   backend.Name,
-								HTTPStatus: resp.StatusCode,
-								InputChars: len(transcript),
-								LatencyMs:  time.Since(llmStart).Milliseconds(),
-								Hint:       "post-process failed; returning raw transcript",
-							})
-						}
-					} else {
-						transcript = resultText
-						mode = resultMode
+						resp.Body = io.NopCloser(bytes.NewReader(respBody))
+						return nil
 					}
-				}
 
-				writeTranscriptionResponse(resp, transcript, mode, responseFormat, e2eClientKey)
-				return nil
-			},
-			Transport: sttBackendTransport,
-			ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
-				// Distinguish upstream-canceled (user started a new recording
-				// mid-flight, client disconnect) from genuine transport
-				// failures. Without this hook these failures silently write
-				// a 502 and leave no `errors` point — confirmed 30d sweep
-				// showed zero error points matched against `http: proxy
-				// error: context canceled` log lines.
-				kind := "stt_backend_error"
-				hint := "backend transport failed"
-				if errors.Is(err, context.Canceled) {
-					kind = "stt_upstream_canceled"
-					hint = "upstream canceled (client disconnect or new request)"
-				}
-				log.Printf("http: proxy error: %v", err)
-				if OnError != nil {
-					OnError(req.Context(), ErrorEvent{
-						Source:     "stt",
-						Kind:       kind,
-						Endpoint:   "/v1/audio/transcriptions",
-						Provider:   backend.Name,
-						HTTPStatus: http.StatusBadGateway,
-						Hint:       hint,
-					})
-				}
-				if OnRequestFailed != nil {
-					OnRequestFailed(req.Context(), errTypeSTTError)
-				}
-				rw.WriteHeader(http.StatusBadGateway)
-			},
+					// Parse {"text": "..."} — permissive: also succeeds on verbose_json
+					// because Go's json.Unmarshal ignores extra fields.
+					var transcription struct {
+						Text     string `json:"text"`
+						Language string `json:"language"`
+					}
+					if err := json.Unmarshal(respBody, &transcription); err != nil || transcription.Text == "" {
+						resp.Body = io.NopCloser(bytes.NewReader(respBody))
+						return nil
+					}
+
+					// Whisper verbose_json path: re-wrap as {"text":"..."} before any
+					// further processing so the client never sees verbose_json. Also
+					// record the detected language into the device profile.
+					if detectActive && isWhisperTier && transcription.Language != "" {
+						if wrapped, marshalErr := json.Marshal(map[string]string{"text": transcription.Text}); marshalErr == nil {
+							respBody = wrapped
+						}
+						if adCtx.DeviceHash != "" && g.profileStore != nil {
+							go g.profileStore.RecordLanguage(adCtx.DeviceHash, transcription.Language)
+						}
+						if g.OnAutoDetect != nil {
+							g.OnAutoDetect(resp.Request.Context(), "", transcription.Language)
+						}
+					}
+
+					transcript := transcription.Text
+					if g.OnTranscription != nil {
+						g.OnTranscription(resp.Request.Context(), proxyBackend.Name, whisperMs, len(transcript), audioDurationMs, enhanceEnabled, e2eClientKey != "")
+					}
+
+					// Backends with a custom TargetPath (e.g. Canary) may return extra fields
+					// (e.g. "timestamps":null) that aren't part of the gateway contract — always
+					// normalize their response body to {"text":"..."}.
+					needsNormalize := proxyBackend.TargetPath != ""
+					needsRewrite := (postProcess != nil && enhanceEnabled) || e2eClientKey != "" || needsNormalize || responseFormat != "json"
+					if !needsRewrite {
+						resp.Body = io.NopCloser(bytes.NewReader(respBody))
+						return nil
+					}
+
+					// LLM post-processing (if requested)
+					var mode string
+					if postProcess != nil && enhanceEnabled {
+						intent := r.URL.Query().Get("intent")
+						llmStart := time.Now()
+						resultText, resultMode, err := postProcess(resp.Request.Context(), transcript, contextJSON, intent)
+						llmMs := time.Since(llmStart).Milliseconds()
+						resp.Header.Set("X-Diction-LLM-Ms", fmt.Sprintf("%d", llmMs))
+						if err != nil {
+							log.Printf("post-process error (returning raw): %v", err)
+							if OnError != nil {
+								OnError(resp.Request.Context(), ErrorEvent{
+									Source:     "stt",
+									Kind:       "stt_post_process",
+									Endpoint:   "/v1/audio/transcriptions",
+									Provider:   proxyBackend.Name,
+									HTTPStatus: resp.StatusCode,
+									InputChars: len(transcript),
+									LatencyMs:  time.Since(llmStart).Milliseconds(),
+									Hint:       "post-process failed; returning raw transcript",
+								})
+							}
+						} else {
+							transcript = resultText
+							mode = resultMode
+						}
+					}
+
+					writeTranscriptionResponse(resp, transcript, mode, responseFormat, e2eClientKey)
+					return nil
+				},
+				Transport: sttBackendTransport,
+				ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+					kind := "stt_backend_error"
+					hint := "backend transport failed"
+					if errors.Is(err, context.Canceled) {
+						kind = "stt_upstream_canceled"
+						hint = "upstream canceled (client disconnect or new request)"
+					}
+					log.Printf("http: proxy error: %v", err)
+					if OnError != nil {
+						OnError(req.Context(), ErrorEvent{
+							Source:     "stt",
+							Kind:       kind,
+							Endpoint:   "/v1/audio/transcriptions",
+							Provider:   proxyBackend.Name,
+							HTTPStatus: http.StatusBadGateway,
+							Hint:       hint,
+						})
+					}
+					// Note: OnRequestFailed is NOT called here — the caller
+					// (ResponseRecorder retry path) now owns that decision so
+					// a successful retry doesn't inflate the failure count.
+					rw.WriteHeader(http.StatusBadGateway)
+				},
+			}
 		}
 
-		proxy.ServeHTTP(w, r)
+		// ── Attempt 1: proxy to the primary backend via ResponseRecorder ──
+		rec := httptest.NewRecorder()
+		buildProxy(target, backend).ServeHTTP(rec, r)
+
+		if rec.Code < 500 {
+			// Success (or 4xx client error) — flush to real writer.
+			flushRecorder(rec, w)
+			return
+		}
+
+		// ── 5xx from primary — mark unhealthy and attempt retry ──
+		log.Printf("STT backend %s returned %d — marking unhealthy, attempting retry", backend.Name, rec.Code)
+		g.health.set(backend.Name, false)
+		if OnError != nil {
+			OnError(r.Context(), ErrorEvent{
+				Source:     "stt",
+				Kind:       "stt_backend_5xx",
+				Endpoint:   "/v1/audio/transcriptions",
+				Provider:   backend.Name,
+				HTTPStatus: rec.Code,
+				Hint:       fmt.Sprintf("backend returned %d; demoted and retrying", rec.Code),
+			})
+		}
+
+		// Re-run model selection — the demoted backend will be skipped by health checks.
+		retryModel := ""
+		if detectActive && adResult.Model != "" {
+			// Re-run auto-detect routing (will skip the now-unhealthy model)
+			retryResult := g.ModelForAutoDetect(adCtx)
+			if retryResult.Model != "" && retryResult.Model != model {
+				retryModel = retryResult.Model
+			}
+		}
+		if retryModel == "" {
+			retryModel = g.ModelForLanguage(language)
+		}
+		if retryModel == model {
+			// No alternative backend available — return the original error.
+			log.Printf("No alternative backend for retry (still %s) — returning %d to client", model, rec.Code)
+			if OnRequestFailed != nil {
+				OnRequestFailed(r.Context(), errTypeSTTError)
+			}
+			flushRecorder(rec, w)
+			return
+		}
+
+		retryTarget, retryBackend := g.resolveBackend(retryModel)
+		if retryTarget == nil {
+			log.Printf("Retry backend %s resolved to nil — returning original %d to client", retryModel, rec.Code)
+			if OnRequestFailed != nil {
+				OnRequestFailed(r.Context(), errTypeSTTError)
+			}
+			flushRecorder(rec, w)
+			return
+		}
+
+		log.Printf("Retrying with fallback backend %s (was %s)", retryBackend.Name, backend.Name)
+
+		// Re-rewrite the multipart body for the retry backend. The original
+		// rewrite used the primary backend's NeedsWAV/ForwardModel; the retry
+		// backend may have different settings. We use the original `body` so
+		// the rewrite is clean. Auto-detect injection (verbose_json, language
+		// override) is intentionally omitted — we're in degraded fallback mode,
+		// not optimizing auto-detect tiers.
+		if boundary != "" {
+			converted, newCT, _, err := rewriteMultipart(body, boundary, MultipartRewriteOpts{
+				ConvertToWAV:  retryBackend.NeedsWAV,
+				ForwardModel:  retryBackend.ForwardModel,
+				WhisperPrompt: whisperPrompt,
+			})
+			if err != nil {
+				log.Printf("Multipart rewrite for retry backend %s failed: %v — using original body", retryBackend.Name, err)
+			} else {
+				proxyBody = converted
+				proxyContentType = newCT
+			}
+		}
+
+		// ── Attempt 2: proxy to the fallback backend ──
+		// Reset whisperStart so the latency header reflects the retry attempt.
+		whisperStart = time.Now()
+		retryRec := httptest.NewRecorder()
+		buildProxy(retryTarget, retryBackend).ServeHTTP(retryRec, r)
+
+		// Tag the response so InfluxDB can track retry frequency.
+		retryRec.Header().Set("X-Diction-Route-Retry", "true")
+		retryRec.Header().Set("X-Diction-Route-Model", retryModel)
+
+		if retryRec.Code >= 500 {
+			log.Printf("Retry backend %s also returned %d", retryBackend.Name, retryRec.Code)
+			if OnRequestFailed != nil {
+				OnRequestFailed(r.Context(), errTypeSTTError)
+			}
+		}
+
+		flushRecorder(retryRec, w)
 	}
+}
+
+// flushRecorder copies the captured response from an httptest.ResponseRecorder
+// to a real http.ResponseWriter.
+func flushRecorder(rec *httptest.ResponseRecorder, w http.ResponseWriter) {
+	for k, vals := range rec.Header() {
+		for _, v := range vals {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(rec.Code)
+	w.Write(rec.Body.Bytes())
 }
