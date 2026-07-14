@@ -76,5 +76,13 @@ func DefaultBackends() []Backend {
 		// Disabled: 9.86 GiB VRAM doesn't fit alongside canary-v2 + whisper on the 16GB GPU (see server/docker-compose.yml).
 		// English routing uses canary-v2; this entry stays for alias/models reference but is skipped for warmup + health polling.
 		{Name: "canary-qwen", URL: "http://canary-qwen:9000", Aliases: []string{"canary-qwen", "nvidia/canary-qwen-2.5b"}, CanonicalID: "nvidia/canary-qwen-2.5b", DisplayName: "Canary Qwen", Description: "best-in-class English speech recognition, 5.63% WER", Provider: "canary", NeedsWAV: true, TargetPath: "/inference", Disabled: true},
+
+		// Cohere Transcribe (CohereLabs, OpenAI-compatible /v1/audio/transcriptions, WAV only,
+		// GPU-accelerated) — primary model for en/es/de/nl/fr/pt/it on the private cloud gateway,
+		// per the measured eval (COHERE_TRANSCRIBE_EVAL_RESULTS.md, 2026-07-06). Empty TargetPath
+		// (defaults to /v1/audio/transcriptions) matches its native contract exactly, same posture
+		// as parakeet-v3 — no response normalization/adapter needed. NOT Disabled: it must be
+		// health-polled to be routable by ModelForLanguage/ModelForAutoDetect.
+		{Name: "cohere-transcribe", URL: "http://cohere:5093", Aliases: []string{"cohere-transcribe", "cohere", "CohereLabs/cohere-transcribe-03-2026"}, CanonicalID: "CohereLabs/cohere-transcribe-03-2026", DisplayName: "Cohere Transcribe", Description: "fastest + most accurate for English/Spanish, ties Canary on other EU languages", Provider: "cohere", NeedsWAV: true},
 	}
 }

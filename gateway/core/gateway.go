@@ -30,6 +30,7 @@ type Config struct {
 	FallbackModel string
 	EnglishModel  string
 	ParakeetModel string
+	CohereModel   string
 	MaxBodySize   int64
 
 	// StreamIdleTimeout bounds the gap between successive WebSocket frames on
@@ -50,6 +51,7 @@ type Gateway struct {
 	fallbackModel string
 	englishModel  string
 	parakeetModel string
+	cohereModel   string
 	maxBodySize   int64
 	profileStore  *ProfileStore
 
@@ -94,6 +96,7 @@ func NewGateway(cfg Config) *Gateway {
 		fallbackModel:     cfg.FallbackModel,
 		englishModel:      cfg.EnglishModel,
 		parakeetModel:     cfg.ParakeetModel,
+		cohereModel:       cfg.CohereModel,
 		maxBodySize:       cfg.MaxBodySize,
 		streamIdleTimeout: idle,
 		profileStore:      cfg.ProfileStore,
