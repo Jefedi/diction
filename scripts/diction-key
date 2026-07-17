@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+#
+# diction-key — manage Diction gateway API tokens (host-side tool).
+#
+# The gateway reads bearer tokens from a file (API_TOKENS_FILE), one
+# "token:name" entry per line, blank lines and '#' comments ignored, and
+# hot-reloads the file whenever it changes. This CLI edits that file so you
+# never touch it by hand; the gateway picks up changes on its own within a few
+# seconds (revocations are immediate).
+#
+# It is a HOST-SIDE tool: it edits the file on disk. Do NOT run it inside the
+# container — the file is bind-mounted read-only there, and the container must
+# not modify its own auth file. Because the container mounts the file itself
+# (not just the parent directory), every edit here preserves the file's inode:
+# `create` appends (>>), `delete` rewrites in place via redirection. We never
+# `mv`/rename (that would swap the inode and break the mount / hot-reload).
+#
+set -euo pipefail
+
+# Default points at the AX42 server path; override with DICTION_TOKENS_FILE
+# (e.g. for testing on another host).
+DEFAULT_TOKENS_FILE="/srv/docker/dockerhand/dockhand_data/stacks/ax42/diction/config/tokens.txt"
+TOKENS_FILE="${DICTION_TOKENS_FILE:-$DEFAULT_TOKENS_FILE}"
+
+PROG="$(basename "$0")"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	cat <<EOF
+$PROG — manage Diction gateway API tokens
+
+Usage:
+  $PROG list                 List tokens (name + masked token)
+  $PROG create <name>        Generate a token for <name> and print it once
+  $PROG show <name>          Print the full token for <name>
+  $PROG delete <name>        Remove <name>'s token (immediate revocation)
+  $PROG -h | --help          Show this help
+
+Token file: $TOKENS_FILE
+  Override with the DICTION_TOKENS_FILE environment variable.
+  Needs write access to the file — use sudo on the server.
+  The gateway hot-reloads changes automatically (create/delete take effect
+  within a few seconds; revocation is immediate).
+
+Names may contain letters, digits, '_' and '-' only.
+EOF
+}
+
+# validate_name <name> — dies on an empty or malformed name. Only [A-Za-z0-9_-]
+# is allowed: a ':' or space would break the "token:name" line format and the
+# delete matching.
+validate_name() {
+	local name="$1"
+	[[ -n "$name" ]] || die "name is required"
+	[[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] ||
+		die "invalid name '$name': allowed characters are letters, digits, '_' and '-' (no ':', spaces, or special characters)"
+}
+
+# is_entry <line> — true if the line is a real token entry (not blank/comment
+# and contains a ':'). Sets globals via the caller's read loop.
+is_entry() {
+	local line="$1" trimmed
+	trimmed="${line#"${line%%[![:space:]]*}"}" # strip leading whitespace
+	[[ -n "$trimmed" && "${trimmed:0:1}" != "#" && "$line" == *:* ]]
+}
+
+# lookup_token <name> — prints the token for <name>, returns 1 if not found.
+lookup_token() {
+	local name="$1" line
+	[[ -f "$TOKENS_FILE" ]] || return 1
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		is_entry "$line" || continue
+		if [[ "${line#*:}" == "$name" ]]; then
+			printf '%s' "${line%%:*}"
+			return 0
+		fi
+	done <"$TOKENS_FILE"
+	return 1
+}
+
+# mask_token <token> — first 8 chars + '…' + last 4 chars.
+mask_token() {
+	local tok="$1"
+	if ((${#tok} <= 12)); then
+		printf '************'
+	else
+		printf '%s…%s' "${tok:0:8}" "${tok: -4}"
+	fi
+}
+
+cmd_list() {
+	if [[ ! -f "$TOKENS_FILE" ]]; then
+		printf 'No tokens (%s does not exist yet).\n' "$TOKENS_FILE"
+		return 0
+	fi
+	local line token count=0
+	printf '%-24s %s\n' "NAME" "TOKEN"
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		is_entry "$line" || continue
+		token="${line%%:*}"
+		printf '%-24s %s\n' "${line#*:}" "$(mask_token "$token")"
+		count=$((count + 1))
+	done <"$TOKENS_FILE"
+	((count > 0)) || printf '(no tokens configured)\n'
+}
+
+cmd_create() {
+	local name="$1"
+	validate_name "$name"
+	if lookup_token "$name" >/dev/null; then
+		die "a token for '$name' already exists (delete it first to rotate)"
+	fi
+	mkdir -p "$(dirname "$TOKENS_FILE")"
+	[[ -f "$TOKENS_FILE" ]] || : >"$TOKENS_FILE"
+	# Ensure a trailing newline so we never concatenate onto the last line.
+	if [[ -s "$TOKENS_FILE" ]] && [[ -n "$(tail -c1 "$TOKENS_FILE")" ]]; then
+		printf '\n' >>"$TOKENS_FILE"
+	fi
+	local token
+	token="$(openssl rand -hex 32)"
+	printf '%s:%s\n' "$token" "$name" >>"$TOKENS_FILE" # append: preserves inode
+	printf 'Created token for %s — copy it now, it is shown only once:\n\n  %s\n\n' "$name" "$token"
+	printf 'The gateway will pick it up automatically within a few seconds.\n'
+}
+
+cmd_show() {
+	local name="$1"
+	validate_name "$name"
+	local token
+	token="$(lookup_token "$name")" || die "no token found for '$name'"
+	printf '%s\n' "$token"
+}
+
+cmd_delete() {
+	local name="$1"
+	validate_name "$name"
+	lookup_token "$name" >/dev/null || die "no token found for '$name'"
+	local tmp line
+	tmp="$(mktemp)"
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if is_entry "$line" && [[ "${line#*:}" == "$name" ]]; then
+			continue # drop this token line, keep everything else
+		fi
+		printf '%s\n' "$line"
+	done <"$TOKENS_FILE" >"$tmp"
+	cat "$tmp" >"$TOKENS_FILE" # truncate-in-place: preserves the inode (no rename)
+	rm -f "$tmp"
+	printf 'Revoked token for %s. The gateway drops it within a few seconds.\n' "$name"
+}
+
+main() {
+	local cmd="${1:-}"
+	case "$cmd" in
+	list) cmd_list ;;
+	create)
+		[[ $# -ge 2 ]] || die "usage: $PROG create <name>"
+		cmd_create "$2"
+		;;
+	show)
+		[[ $# -ge 2 ]] || die "usage: $PROG show <name>"
+		cmd_show "$2"
+		;;
+	delete)
+		[[ $# -ge 2 ]] || die "usage: $PROG delete <name>"
+		cmd_delete "$2"
+		;;
+	"" | -h | --help | help) usage ;;
+	*)
+		usage >&2
+		exit 1
+		;;
+	esac
+}
+
+main "$@"
