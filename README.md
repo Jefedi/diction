@@ -596,6 +596,11 @@ abc123def456:jefe
 # revoke by deleting the line — reloaded automatically
 ```
 
+Rather than editing this file by hand, manage entries with the host-side CLI
+[`scripts/diction-key`](scripts/diction-key) (`create` / `list` / `show` /
+`delete`, inode-preserving so the container mount and hot-reload keep working) —
+see [scripts/README.md](scripts/README.md).
+
 Client usage is unchanged from any OpenAI SDK — put the token where the API key goes:
 
 ```python
