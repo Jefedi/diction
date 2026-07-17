@@ -521,10 +521,24 @@ func buildMux() (http.Handler, string, error) {
 	}
 	trials := newTrialStore(trialDBPath)
 
+	// REST backend robustness tunables. Defaults are backward-compatible except
+	// BackendIdleTimeout, deliberately short (5s) to avoid reusing a keep-alive
+	// socket faster-whisper/uvicorn has already closed — the root cause of the
+	// "every other request fails" symptom. BackendMaxConcurrent defaults to 0
+	// (unlimited); set it to 1 for single-worker CPU backends.
+	backendTimeout := core.EnvDurationOrDefault("BACKEND_TIMEOUT", 120*time.Second)
+	backendIdleTimeout := core.EnvDurationOrDefault("BACKEND_IDLE_TIMEOUT", 5*time.Second)
+	backendMaxRetries := core.EnvIntOrDefault("BACKEND_MAX_RETRIES", 1)
+	backendMaxConcurrent := core.EnvIntOrDefault("BACKEND_MAX_CONCURRENT", 0)
+
 	gw := core.NewGateway(core.Config{
-		Backends:     core.DefaultBackends(),
-		DefaultModel: defaultModel,
-		MaxBodySize:  maxBodySize,
+		Backends:             core.DefaultBackends(),
+		DefaultModel:         defaultModel,
+		MaxBodySize:          maxBodySize,
+		BackendTimeout:       backendTimeout,
+		BackendIdleTimeout:   backendIdleTimeout,
+		BackendMaxRetries:    backendMaxRetries,
+		BackendMaxConcurrent: backendMaxConcurrent,
 	})
 
 	// LLM post-processing (BYO LLM for self-hosters)
@@ -537,21 +551,32 @@ func buildMux() (http.Handler, string, error) {
 		}
 	}
 
+	// REST bearer-token auth (multi-user). Orthogonal to AUTH_ENABLED — gates
+	// only the REST OpenAI routes. Nil when API_TOKENS/API_TOKENS_FILE unset,
+	// in which case restTokenMiddleware is a no-op (zero regression).
+	tokens := newTokenStore()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", gw.HealthHandler())
-	mux.HandleFunc("/v1/models", gw.ModelsHandler())
+	mux.HandleFunc("/v1/models", restTokenMiddleware(gw.ModelsHandler(), tokens))
 	mux.HandleFunc("/v1/trial", func(w http.ResponseWriter, r *http.Request) {
 		handleTrial(w, r, trials, trialSecret, trialDuration)
 	})
-	mux.HandleFunc("/v1/audio/transcriptions", authMiddleware(
+	mux.HandleFunc("/v1/audio/transcriptions", restTokenMiddleware(authMiddleware(
 		gw.TranscriptionHandlerWithPostProcess(postProcess), authEnabled, bundleID, trialSecret,
-	))
+	), tokens))
 	mux.HandleFunc("/v1/audio/stream", authMiddleware(
 		gw.StreamingHandlerWithPostProcess(postProcess), authEnabled, bundleID, trialSecret,
 	))
 	mux.HandleFunc("/", gw.CatchAllHandler())
 
-	log.Printf("Diction Gateway starting on :%s (default_model=%s, auth=%v, trial=%v, llm=%v)", port, defaultModel, authEnabled, len(trialSecret) > 0, llm.Enabled)
+	restAuthActive := tokens != nil
+	restTokenCount := 0
+	if tokens != nil {
+		restTokenCount = tokens.count()
+	}
+	log.Printf("Diction Gateway starting on :%s (default_model=%s, auth=%v, trial=%v, llm=%v, rest_token_auth=%v, rest_tokens=%d)", port, defaultModel, authEnabled, len(trialSecret) > 0, llm.Enabled, restAuthActive, restTokenCount)
+	log.Printf("Backend robustness: timeout=%s idle_conn_timeout=%s max_retries=%d max_concurrent=%d", backendTimeout, backendIdleTimeout, backendMaxRetries, backendMaxConcurrent)
 	return mux, port, nil
 }
 
