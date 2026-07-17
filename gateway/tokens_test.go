@@ -82,6 +82,84 @@ func TestRestTokenMiddleware_Validation(t *testing.T) {
 	}
 }
 
+func TestTokenFromRequest(t *testing.T) {
+	// Header always wins over query.
+	r := httptest.NewRequest(http.MethodGet, "/v1/audio/stream?token=qtok", nil)
+	r.Header.Set("Authorization", "Bearer htok")
+	if got := tokenFromRequest(r, true); got != "htok" {
+		t.Errorf("header should win: got %q", got)
+	}
+	// ?token when no header (allowQuery).
+	r = httptest.NewRequest(http.MethodGet, "/v1/audio/stream?token=qtok", nil)
+	if got := tokenFromRequest(r, true); got != "qtok" {
+		t.Errorf("?token: got %q", got)
+	}
+	// ?api_key fallback.
+	r = httptest.NewRequest(http.MethodGet, "/v1/audio/stream?api_key=atok", nil)
+	if got := tokenFromRequest(r, true); got != "atok" {
+		t.Errorf("?api_key: got %q", got)
+	}
+	// ?token beats ?api_key.
+	r = httptest.NewRequest(http.MethodGet, "/v1/audio/stream?token=qtok&api_key=atok", nil)
+	if got := tokenFromRequest(r, true); got != "qtok" {
+		t.Errorf("?token should beat ?api_key: got %q", got)
+	}
+	// allowQuery=false must ignore query params entirely (REST never trusts them).
+	r = httptest.NewRequest(http.MethodGet, "/v1/models?token=qtok&api_key=atok", nil)
+	if got := tokenFromRequest(r, false); got != "" {
+		t.Errorf("REST must ignore query token, got %q", got)
+	}
+}
+
+func TestWsTokenMiddleware(t *testing.T) {
+	next := func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK); _, _ = w.Write([]byte("upgraded")) }
+
+	// nil store → passthrough (WS stays open, zero regression).
+	rr := httptest.NewRecorder()
+	wsTokenMiddleware(next, nil)(rr, httptest.NewRequest(http.MethodGet, "/v1/audio/stream", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("nil store must pass through, got %d", rr.Code)
+	}
+
+	store := &tokenStore{tokens: map[string]string{"abc": "jefe"}}
+	h := wsTokenMiddleware(next, store)
+
+	cases := []struct {
+		name     string
+		url      string
+		header   string
+		wantCode int
+	}{
+		{"no token", "/v1/audio/stream", "", http.StatusUnauthorized},
+		{"good query token", "/v1/audio/stream?token=abc", "", http.StatusOK},
+		{"bad query token", "/v1/audio/stream?token=wrong", "", http.StatusUnauthorized},
+		{"good api_key", "/v1/audio/stream?api_key=abc", "", http.StatusOK},
+		{"good header", "/v1/audio/stream", "Bearer abc", http.StatusOK},
+		{"bad header", "/v1/audio/stream", "Bearer wrong", http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			rr := httptest.NewRecorder()
+			h(rr, req)
+			if rr.Code != tc.wantCode {
+				t.Fatalf("code = %d, want %d", rr.Code, tc.wantCode)
+			}
+			if tc.wantCode == http.StatusUnauthorized {
+				if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+					t.Errorf("content-type = %q, want application/json", ct)
+				}
+				if !strings.Contains(rr.Body.String(), `"error"`) {
+					t.Errorf("401 body = %q, want JSON error", rr.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestNewTokenStore_InactiveWhenUnset(t *testing.T) {
 	t.Setenv("API_TOKENS", "")
 	t.Setenv("API_TOKENS_FILE", "")

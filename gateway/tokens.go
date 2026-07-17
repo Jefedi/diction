@@ -145,27 +145,68 @@ func (s *tokenStore) count() int {
 	return len(s.tokens)
 }
 
-// restTokenMiddleware wraps a handler with bearer-token auth. When store is nil
-// the handler is returned unchanged (auth inactive — identical to prior behavior).
-// On success it logs the associated user name; on missing/invalid tokens it
-// returns HTTP 401 with a JSON body matching the existing error shape.
+// tokenFromRequest extracts the bearer token from a request. The Authorization
+// header ("Bearer <token>") is always checked first. When allowQuery is true it
+// falls back to the ?token then ?api_key query parameters — used ONLY for the
+// WebSocket upgrade, where clients (the native iOS app) can't always set a
+// header. REST routes pass allowQuery=false: tokens in URLs leak into access
+// logs, history, and referrers, so they are never accepted there.
+func tokenFromRequest(r *http.Request, allowQuery bool) string {
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	if allowQuery {
+		if t := strings.TrimSpace(r.URL.Query().Get("token")); t != "" {
+			return t
+		}
+		if t := strings.TrimSpace(r.URL.Query().Get("api_key")); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// restTokenMiddleware wraps a REST handler with bearer-token auth (header only).
+// When store is nil the handler is returned unchanged (auth inactive — identical
+// to prior behavior). On success it logs the associated user name; on
+// missing/invalid tokens it returns HTTP 401 with a JSON body matching the
+// existing error shape.
 func restTokenMiddleware(next http.HandlerFunc, store *tokenStore) http.HandlerFunc {
 	if store == nil {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			writeTokenAuthError(w)
-			return
-		}
-		token := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+		token := tokenFromRequest(r, false)
 		name, ok := store.lookup(token)
 		if token == "" || !ok {
 			writeTokenAuthError(w)
 			return
 		}
 		log.Printf("REST auth: %q authorized for %s %s", name, r.Method, r.URL.Path)
+		next(w, r)
+	}
+}
+
+// wsTokenMiddleware gates the WebSocket upgrade with the SAME token store as the
+// REST routes, accepting the token via header OR query param (?token / ?api_key)
+// because WebSocket clients can't always set an Authorization header. It runs
+// before the upgrade: a missing/invalid token returns 401 and the connection is
+// never promoted to a WebSocket, so the post-upgrade native handshake is left
+// untouched. store == nil → no-op (identical to prior behavior, zero regression).
+func wsTokenMiddleware(next http.HandlerFunc, store *tokenStore) http.HandlerFunc {
+	if store == nil {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := tokenFromRequest(r, true)
+		name, ok := store.lookup(token)
+		if token == "" || !ok {
+			writeTokenAuthError(w)
+			return
+		}
+		// Security: never log the token or the query string — only the user name
+		// and the path (r.URL.Path excludes the ?token=… query).
+		log.Printf("WS auth: %q authorized for %s", name, r.URL.Path)
 		next(w, r)
 	}
 }

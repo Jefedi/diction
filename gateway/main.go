@@ -565,9 +565,9 @@ func buildMux() (http.Handler, string, error) {
 	mux.HandleFunc("/v1/audio/transcriptions", restTokenMiddleware(authMiddleware(
 		gw.TranscriptionHandlerWithPostProcess(postProcess), authEnabled, bundleID, trialSecret,
 	), tokens))
-	mux.HandleFunc("/v1/audio/stream", authMiddleware(
+	mux.HandleFunc("/v1/audio/stream", wsTokenMiddleware(authMiddleware(
 		gw.StreamingHandlerWithPostProcess(postProcess), authEnabled, bundleID, trialSecret,
-	))
+	), tokens))
 	mux.HandleFunc("/", gw.CatchAllHandler())
 
 	restAuthActive := tokens != nil
