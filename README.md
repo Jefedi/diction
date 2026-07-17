@@ -545,6 +545,110 @@ Works with the Node SDK, LangChain, Flowise, n8n, or any tool that expects OpenA
 
 ---
 
+## Fork additions
+
+This fork adds two things on top of upstream: multi-user REST bearer-token auth
+and REST-path robustness hardening. Both are opt-in via environment variables and
+default to the exact upstream behavior — nothing changes unless you set them.
+
+### Multi-user API tokens (REST)
+
+A bearer-token layer that gates **only** the REST OpenAI routes
+(`POST /v1/audio/transcriptions`, `GET /v1/models`). It is independent of, and
+orthogonal to, the native `AUTH_ENABLED` subscription handshake and does **not**
+touch the WebSocket `/v1/audio/stream`.
+
+Configure tokens two ways (they merge):
+
+| Env var | Format | Notes |
+| --- | --- | --- |
+| `API_TOKENS` | `token:name` pairs, comma-separated | e.g. `API_TOKENS="abc123:jefe,def456:pote1"` |
+| `API_TOKENS_FILE` | path to a file, one `token:name` per line | blank lines and `#` comments ignored; **hot-reloaded** on change |
+
+When both are unset the middleware is inactive (zero regression). When active,
+requests need `Authorization: Bearer <token>`; a valid token is logged by user
+name, and a missing/invalid one returns `401` with `{"error":"..."}`. Tokens are
+never written to the logs.
+
+Example `tokens.txt` (mount at `API_TOKENS_FILE`):
+
+```text
+# Diction API tokens — one "token:name" per line
+abc123def456:jefe
+789ghi012jkl:pote1
+# revoke by deleting the line — reloaded automatically
+```
+
+Client usage is unchanged from any OpenAI SDK — put the token where the API key goes:
+
+```python
+client = OpenAI(base_url="http://your-server:8080/v1", api_key="abc123def456")
+```
+
+### Backend robustness
+
+Hardens the REST → speech-backend path against a stale keep-alive connection
+being reused after `faster-whisper`/uvicorn already closed it (the classic
+"every other request fails" symptom), plus timeouts, clean JSON errors, and
+optional concurrency limiting.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `BACKEND_IDLE_TIMEOUT` | `5s` | Idle-connection timeout of the backend pool. Kept below the backend's keep-alive timeout so a socket the backend closed is never reused. Raise it (e.g. `30s`) only if your backend keeps idle connections open longer. |
+| `BACKEND_MAX_RETRIES` | `1` | Extra attempts on the **same** backend for a transient transport error (reset/EOF/refused). Not retried on timeout or client cancel. |
+| `BACKEND_TIMEOUT` | `120s` | Per-request deadline to the backend (covers concurrency-queue wait too). Exceeded → `504` with a JSON error. |
+| `BACKEND_MAX_CONCURRENT` | `0` (unlimited) | Cap on simultaneous in-flight backend requests. Set to `1` for a single-worker CPU backend like `faster-whisper-medium` int8. |
+
+Backend transport failures now always return a JSON body (`502` unreachable,
+`504` timeout) instead of an empty response.
+
+### Using this fork's image
+
+CI publishes a multi-arch (amd64 + arm64) image to this fork's GHCR namespace on
+every push to `main` and on version tags:
+
+```yaml
+services:
+  gateway:
+    image: ghcr.io/<your-github-user>/diction-gateway:latest
+    container_name: diction-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      DEFAULT_MODEL: medium
+      # Multi-user REST tokens (optional)
+      API_TOKENS_FILE: /config/tokens.txt
+      # Robustness (optional; shown with recommended values for faster-whisper CPU)
+      BACKEND_MAX_CONCURRENT: 1
+    volumes:
+      - ./tokens.txt:/config/tokens.txt:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  whisper-medium:
+    image: fedirz/faster-whisper-server:latest-cpu
+    container_name: diction-whisper-medium
+    restart: unless-stopped
+    volumes:
+      - whisper-models:/root/.cache/huggingface
+    environment:
+      WHISPER__MODEL: Systran/faster-whisper-medium
+      WHISPER__INFERENCE_DEVICE: cpu
+
+volumes:
+  whisper-models:
+    name: diction-whisper-models
+```
+
+Replace `<your-github-user>` with your GitHub username (lowercased). The image
+is published automatically by `.github/workflows/build.yml`.
+
+---
+
 ## Privacy
 
 - **On-device**: Everything stays on your phone. No network connection is made.

@@ -1,0 +1,17 @@
+# Diction gateway — REST API tokens (multi-user bearer auth)
+#
+# One "token:name" per line. Blank lines and lines starting with '#' are ignored.
+# Mount this file into the gateway and point API_TOKENS_FILE at it, e.g.:
+#
+#   environment:
+#     API_TOKENS_FILE: /config/tokens.txt
+#   volumes:
+#     - ./tokens.txt:/config/tokens.txt:ro
+#
+# The file is hot-reloaded: add or remove a line and the change is picked up
+# without restarting the gateway. Tokens are never written to the logs.
+#
+# Generate a token with:  openssl rand -hex 24
+
+abc123def456replaceme:jefe
+789ghi012jklreplaceme:pote1
