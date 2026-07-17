@@ -19,6 +19,17 @@ func EnvFloatOrDefault(key string, fallback float64) float64 {
 	return fallback
 }
 
+// EnvDurationOrDefault parses a Go duration string (e.g. "120s", "5s", "2m").
+// Invalid or unset values fall back to the default.
+func EnvDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
 // defaultStreamIdleTimeout is the fallback inter-frame gap for WebSocket
 // audio streams. 45s is generous: healthy streams send frames every ~100ms.
 const defaultStreamIdleTimeout = 45 * time.Second
@@ -37,6 +48,30 @@ type Config struct {
 	// /v1/audio/stream. Zero → falls back to defaultStreamIdleTimeout.
 	// Healthy streams send an audio frame every ~100ms, so 45s is generous.
 	StreamIdleTimeout time.Duration
+
+	// --- REST backend robustness (see proxy.go) ---
+	//
+	// BackendTimeout bounds a single REST transcription request to the STT
+	// backend (including time queued behind BackendMaxConcurrent). Zero → no
+	// explicit deadline (only the transport's ResponseHeaderTimeout applies).
+	BackendTimeout time.Duration
+
+	// BackendIdleTimeout is the idle-connection timeout of the STT transport
+	// pool. Keeping it below the backend's own keep-alive timeout avoids reusing
+	// a socket the backend already closed (the classic "every other request
+	// fails" symptom with faster-whisper/uvicorn). Zero → 90s (legacy default).
+	BackendIdleTimeout time.Duration
+
+	// BackendMaxRetries is the number of extra attempts on the SAME backend when
+	// a request fails with a transient transport error (EOF/reset/refused, e.g.
+	// a stale keep-alive socket). Does not retry on timeout or client cancel.
+	// Zero → no transport-level retry.
+	BackendMaxRetries int
+
+	// BackendMaxConcurrent caps simultaneous in-flight requests to the STT
+	// backend. Zero → unlimited (legacy behavior). Set to 1 for single-worker
+	// CPU backends like faster-whisper-medium int8.
+	BackendMaxConcurrent int
 
 	// ProfileStore enables per-device language history for auto-detect routing.
 	// Nil in community builds without MariaDB — auto-detect always falls back to whisper_safe.
@@ -58,6 +93,13 @@ type Gateway struct {
 	// streamIdleTimeout bounds inter-frame gap on /v1/audio/stream. See Config.
 	// Tests override the field directly after construction.
 	streamIdleTimeout time.Duration
+
+	// REST backend robustness knobs. See Config for semantics.
+	// Tests may set these directly after constructing a Gateway literal.
+	transport         http.RoundTripper // nil → package-level sttBackendTransport
+	backendTimeout    time.Duration     // 0 → no explicit deadline
+	backendMaxRetries int               // 0 → no transient transport retry
+	backendSem        chan struct{}     // nil → unlimited concurrency
 
 	// OnTranscription is an optional hook called after each successful transcription.
 	// model is the backend name, whisperMs is inference latency, chars is transcript length,
@@ -89,6 +131,26 @@ func NewGateway(cfg Config) *Gateway {
 	if idle <= 0 {
 		idle = defaultStreamIdleTimeout
 	}
+
+	// Build the STT backend transport. IdleConnTimeout is kept short by default
+	// (see Config.BackendIdleTimeout) so we never reuse a keep-alive socket the
+	// backend has already closed. Other params mirror the package default.
+	backendIdle := cfg.BackendIdleTimeout
+	if backendIdle <= 0 {
+		backendIdle = 90 * time.Second
+	}
+	transport := &http.Transport{
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   5,
+		IdleConnTimeout:       backendIdle,
+		ResponseHeaderTimeout: 10 * time.Minute,
+	}
+
+	var sem chan struct{}
+	if cfg.BackendMaxConcurrent > 0 {
+		sem = make(chan struct{}, cfg.BackendMaxConcurrent)
+	}
+
 	g := &Gateway{
 		backends:          backends,
 		health:            newHealthState(),
@@ -100,6 +162,10 @@ func NewGateway(cfg Config) *Gateway {
 		maxBodySize:       cfg.MaxBodySize,
 		streamIdleTimeout: idle,
 		profileStore:      cfg.ProfileStore,
+		transport:         transport,
+		backendTimeout:    cfg.BackendTimeout,
+		backendMaxRetries: cfg.BackendMaxRetries,
+		backendSem:        sem,
 	}
 	g.startHealthChecker()
 	return g

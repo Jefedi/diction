@@ -470,7 +470,11 @@ func (g *Gateway) TranscriptionHandlerWithPostProcess(postProcess func(context.C
 		enhanceEnabled := r.URL.Query().Get("enhance") == "true"
 		whisperStart := time.Now()
 
-		buildProxy := func(proxyTarget *url.URL, proxyBackend *Backend) *httputil.ReverseProxy {
+		buildProxy := func(proxyTarget *url.URL, proxyBackend *Backend, transportErr *error) *httputil.ReverseProxy {
+			tr := g.transport
+			if tr == nil {
+				tr = sttBackendTransport
+			}
 			return &httputil.ReverseProxy{
 				Director: func(req *http.Request) {
 					req.URL.Scheme = proxyTarget.Scheme
@@ -577,11 +581,23 @@ func (g *Gateway) TranscriptionHandlerWithPostProcess(postProcess func(context.C
 					writeTranscriptionResponse(resp, transcript, mode, responseFormat, e2eClientKey)
 					return nil
 				},
-				Transport: sttBackendTransport,
+				Transport: tr,
 				ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+					// Surface the transport error to the caller so it can decide
+					// whether to retry the same backend (stale keep-alive, reset)
+					// vs. treat it as terminal (timeout, client cancel).
+					if transportErr != nil {
+						*transportErr = err
+					}
 					kind := "stt_backend_error"
 					hint := "backend transport failed"
-					if errors.Is(err, context.Canceled) {
+					status := http.StatusBadGateway
+					switch {
+					case errors.Is(err, context.DeadlineExceeded):
+						kind = "stt_backend_timeout"
+						hint = "backend timed out"
+						status = http.StatusGatewayTimeout
+					case errors.Is(err, context.Canceled):
 						kind = "stt_upstream_canceled"
 						hint = "upstream canceled (client disconnect or new request)"
 					}
@@ -592,21 +608,77 @@ func (g *Gateway) TranscriptionHandlerWithPostProcess(postProcess func(context.C
 							Kind:       kind,
 							Endpoint:   "/v1/audio/transcriptions",
 							Provider:   proxyBackend.Name,
-							HTTPStatus: http.StatusBadGateway,
+							HTTPStatus: status,
 							Hint:       hint,
 						})
 					}
 					// Note: OnRequestFailed is NOT called here — the caller
 					// (ResponseRecorder retry path) now owns that decision so
 					// a successful retry doesn't inflate the failure count.
-					rw.WriteHeader(http.StatusBadGateway)
+					// Emit a clean JSON error body so the client never sees an
+					// empty 502/504.
+					writeBackendError(rw, err)
 				},
 			}
 		}
 
-		// ── Attempt 1: proxy to the primary backend via ResponseRecorder ──
-		rec := httptest.NewRecorder()
-		buildProxy(target, backend).ServeHTTP(rec, r)
+		// Apply an explicit backend deadline covering the queue wait (below) plus
+		// the request itself. Without this a hung backend could pend until the
+		// transport's ResponseHeaderTimeout (10 min). 0 → no explicit deadline.
+		if g.backendTimeout > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), g.backendTimeout)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+
+		// Serialize concurrency if configured (0 = unlimited, legacy behavior).
+		// Single-worker CPU backends (faster-whisper-medium int8) melt down under
+		// parallel load; a cap of 1 makes them behave. Bounded by the deadline so
+		// a saturated backend fails fast with a clean error instead of piling up.
+		if g.backendSem != nil {
+			select {
+			case g.backendSem <- struct{}{}:
+				defer func() { <-g.backendSem }()
+			case <-r.Context().Done():
+				log.Printf("STT backend %s: timed out waiting for a concurrency slot", backend.Name)
+				if OnError != nil {
+					OnError(r.Context(), ErrorEvent{
+						Source:     "stt",
+						Kind:       "stt_backend_saturated",
+						Endpoint:   "/v1/audio/transcriptions",
+						Provider:   backend.Name,
+						HTTPStatus: http.StatusGatewayTimeout,
+						Hint:       "no concurrency slot before deadline",
+					})
+				}
+				if OnRequestFailed != nil {
+					OnRequestFailed(r.Context(), errTypeSTTError)
+				}
+				writeBackendError(w, r.Context().Err())
+				return
+			}
+		}
+
+		// ── Attempt 1 (+ transient transport-error retries on the same backend) ──
+		// A stale keep-alive socket — one the backend closed after its own idle
+		// timeout while Go still had it pooled — surfaces as a transport error,
+		// not an HTTP 5xx. Retrying once on a fresh connection is the direct fix
+		// for the "every other request fails" symptom. We do NOT retry on timeout
+		// or client cancel (see isRetriableTransportErr).
+		var (
+			rec          *httptest.ResponseRecorder
+			transportErr error
+		)
+		for attempt := 0; ; attempt++ {
+			rec = httptest.NewRecorder()
+			transportErr = nil
+			buildProxy(target, backend, &transportErr).ServeHTTP(rec, r)
+			if transportErr == nil || attempt >= g.backendMaxRetries || !isRetriableTransportErr(transportErr) {
+				break
+			}
+			log.Printf("STT backend %s: transient transport error (attempt %d/%d), retrying on fresh connection: %v",
+				backend.Name, attempt+1, g.backendMaxRetries+1, transportErr)
+		}
 
 		if rec.Code < 500 {
 			// Success (or 4xx client error) — flush to real writer.
@@ -686,7 +758,7 @@ func (g *Gateway) TranscriptionHandlerWithPostProcess(postProcess func(context.C
 		// Reset whisperStart so the latency header reflects the retry attempt.
 		whisperStart = time.Now()
 		retryRec := httptest.NewRecorder()
-		buildProxy(retryTarget, retryBackend).ServeHTTP(retryRec, r)
+		buildProxy(retryTarget, retryBackend, nil).ServeHTTP(retryRec, r)
 
 		// Tag the response so InfluxDB can track retry frequency.
 		retryRec.Header().Set("X-Diction-Route-Retry", "true")
@@ -701,6 +773,32 @@ func (g *Gateway) TranscriptionHandlerWithPostProcess(postProcess func(context.C
 
 		flushRecorder(retryRec, w)
 	}
+}
+
+// isRetriableTransportErr reports whether a ReverseProxy transport error is a
+// transient connection-level failure worth retrying on a fresh socket (stale
+// keep-alive, connection reset/refused). Deadline and client-cancel are NOT
+// retriable — retrying a timeout just burns another full deadline, and a
+// cancelled request means the client already went away.
+func isRetriableTransportErr(err error) bool {
+	return err != nil &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded)
+}
+
+// writeBackendError writes a clean JSON error body for a backend transport
+// failure: 504 on a deadline, 502 otherwise. Safe to call on either the real
+// writer or an httptest.ResponseRecorder.
+func writeBackendError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	msg := "backend unavailable"
+	if errors.Is(err, context.DeadlineExceeded) {
+		status = http.StatusGatewayTimeout
+		msg = "backend timeout"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"error":%q}`, msg)
 }
 
 // flushRecorder copies the captured response from an httptest.ResponseRecorder
