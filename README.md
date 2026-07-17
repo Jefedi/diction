@@ -73,7 +73,9 @@ services:
       WHISPER__INFERENCE_DEVICE: cpu
 
   gateway:
-    image: ghcr.io/omachala/diction-gateway:latest
+    # This fork's image is published to GHCR only after your first merge to
+    # main (build.yml). Until then use upstream: ghcr.io/omachala/diction-gateway:latest
+    image: ghcr.io/jefedi/diction-gateway:latest
     platform: linux/amd64
     container_name: diction-gateway
     restart: unless-stopped
@@ -278,7 +280,9 @@ services:
               capabilities: [gpu]
 
   gateway:
-    image: ghcr.io/omachala/diction-gateway:latest
+    # This fork's image is published to GHCR only after your first merge to
+    # main (build.yml). Until then use upstream: ghcr.io/omachala/diction-gateway:latest
+    image: ghcr.io/jefedi/diction-gateway:latest
     platform: linux/amd64
     container_name: diction-gateway
     restart: unless-stopped
@@ -319,7 +323,9 @@ services:
               capabilities: [gpu]
 
   gateway:
-    image: ghcr.io/omachala/diction-gateway:latest
+    # This fork's image is published to GHCR only after your first merge to
+    # main (build.yml). Until then use upstream: ghcr.io/omachala/diction-gateway:latest
+    image: ghcr.io/jefedi/diction-gateway:latest
     platform: linux/amd64
     container_name: diction-gateway
     restart: unless-stopped
@@ -345,7 +351,9 @@ Keep it. Use `CUSTOM_BACKEND_URL` to put the Diction Gateway in front of your ex
 ```yaml
 services:
   gateway:
-    image: ghcr.io/omachala/diction-gateway:latest
+    # This fork's image is published to GHCR only after your first merge to
+    # main (build.yml). Until then use upstream: ghcr.io/omachala/diction-gateway:latest
+    image: ghcr.io/jefedi/diction-gateway:latest
     platform: linux/amd64
     container_name: diction-gateway
     restart: unless-stopped
