@@ -11,6 +11,11 @@
 # The file is hot-reloaded: add or remove a line and the change is picked up
 # without restarting the gateway. Tokens are never written to the logs.
 #
+# Security: this file holds live credentials.
+#   cp tokens.txt.example tokens.txt && chmod 600 tokens.txt
+# It is already in .gitignore — never commit it. Edit in place (the container
+# pins the file's inode); see the README for the single-file bind-mount caveat.
+#
 # Generate a token with:  openssl rand -hex 24
 
 abc123def456replaceme:jefe

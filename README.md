@@ -610,11 +610,10 @@ every push to `main` and on version tags:
 ```yaml
 services:
   gateway:
-    image: ghcr.io/<your-github-user>/diction-gateway:latest
-    container_name: diction-gateway
+    image: ghcr.io/jefedi/diction-gateway:latest
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "100.64.0.2:8093:8080"   # bind to your host/overlay IP as needed
     environment:
       DEFAULT_MODEL: medium
       # Multi-user REST tokens (optional)
@@ -631,7 +630,6 @@ services:
 
   whisper-medium:
     image: fedirz/faster-whisper-server:latest-cpu
-    container_name: diction-whisper-medium
     restart: unless-stopped
     volumes:
       - whisper-models:/root/.cache/huggingface
@@ -644,8 +642,24 @@ volumes:
     name: diction-whisper-models
 ```
 
-Replace `<your-github-user>` with your GitHub username (lowercased). The image
-is published automatically by `.github/workflows/build.yml`.
+The image name is derived from the repo owner by
+`.github/workflows/build.yml` (lowercased), so it publishes to
+`ghcr.io/jefedi/diction-gateway` automatically — no manual edit of the
+workflow is needed.
+
+Keep `tokens.txt` out of git and off-disk-readable:
+
+```bash
+echo "tokens.txt" >> .gitignore   # already ignored in this fork
+chmod 600 tokens.txt              # owner-only; it holds live credentials
+```
+
+The `:ro` mount is fine for hot-reload — the store only reads the file. One
+Docker caveat: a single-file bind mount pins the inode, so edit `tokens.txt`
+**in place** (e.g. `nano`, or `vim` with `set backupcopy=yes`). Editors that
+save via temp-file + rename replace the inode and the container keeps seeing
+the old file; mount the parent directory (`./config:/config:ro`) if you rely
+on such an editor. Changes are picked up within ~10s.
 
 ---
 

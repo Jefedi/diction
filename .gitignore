@@ -1,2 +1,5 @@
 .env
 .DS_Store
+
+# Live REST API tokens — never commit. Copy tokens.txt.example → tokens.txt.
+tokens.txt
