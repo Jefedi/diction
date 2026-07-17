@@ -555,16 +555,16 @@ Works with the Node SDK, LangChain, Flowise, n8n, or any tool that expects OpenA
 
 ## Fork additions
 
-This fork adds two things on top of upstream: multi-user REST bearer-token auth
+This fork adds two things on top of upstream: multi-user bearer-token auth
 and REST-path robustness hardening. Both are opt-in via environment variables and
 default to the exact upstream behavior — nothing changes unless you set them.
 
-### Multi-user API tokens (REST)
+### Multi-user API tokens
 
-A bearer-token layer that gates **only** the REST OpenAI routes
-(`POST /v1/audio/transcriptions`, `GET /v1/models`). It is independent of, and
-orthogonal to, the native `AUTH_ENABLED` subscription handshake and does **not**
-touch the WebSocket `/v1/audio/stream`.
+A bearer-token layer that gates the REST OpenAI routes
+(`POST /v1/audio/transcriptions`, `GET /v1/models`) **and** the WebSocket
+`/v1/audio/stream`. It is independent of, and orthogonal to, the native
+`AUTH_ENABLED` subscription handshake.
 
 Configure tokens two ways (they merge):
 
@@ -573,10 +573,19 @@ Configure tokens two ways (they merge):
 | `API_TOKENS` | `token:name` pairs, comma-separated | e.g. `API_TOKENS="abc123:jefe,def456:pote1"` |
 | `API_TOKENS_FILE` | path to a file, one `token:name` per line | blank lines and `#` comments ignored; **hot-reloaded** on change |
 
-When both are unset the middleware is inactive (zero regression). When active,
-requests need `Authorization: Bearer <token>`; a valid token is logged by user
-name, and a missing/invalid one returns `401` with `{"error":"..."}`. Tokens are
-never written to the logs.
+When both are unset the middleware is inactive (zero regression). When active, a
+valid token is logged by user name, and a missing/invalid one returns `401` with
+`{"error":"..."}`. Tokens are never written to the logs.
+
+- **REST** (`/v1/models`, `/v1/audio/transcriptions`): token via
+  `Authorization: Bearer <token>` header **only**. Query-param tokens are refused
+  on REST — they leak into access logs, history, and referrers.
+- **WebSocket** (`/v1/audio/stream`): token via the `Authorization` header
+  **or**, since WebSocket clients (the native iOS app) can't always set a header,
+  via a query param — `wss://host/v1/audio/stream?token=<token>` (or `?api_key=`).
+  The token is checked **before** the upgrade: an invalid one gets a plain `401`
+  and the socket is never opened, so the post-upgrade native encrypted handshake
+  is untouched. Order of precedence: header → `?token` → `?api_key`.
 
 Example `tokens.txt` (mount at `API_TOKENS_FILE`):
 
